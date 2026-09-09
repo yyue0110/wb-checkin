@@ -1,0 +1,17 @@
+# 含凭证的本地配置 —— 绝不提交
+config.json
+*.local.json
+.env
+
+# token 状态缓存
+state/
+
+# 日志
+*.log
+checkin.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

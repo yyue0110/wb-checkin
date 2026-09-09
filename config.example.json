@@ -1,0 +1,18 @@
+{
+  "_comment": "本地配置文件示例。复制为 config.json 后填写；config.json 已被 .gitignore 忽略，不会进版本库。生产环境建议改用环境变量（GitHub Secrets）。",
+
+  "domain": "www.workbuddy.cn",
+
+  "access_token": "",
+  "refresh_token": "",
+  "uid": "",
+
+  "state_file": "",
+
+  "smtp_host": "smtp.qq.com",
+  "smtp_port": 465,
+  "smtp_user": "your_email@qq.com",
+  "smtp_pass": "",
+  "smtp_from": "",
+  "alert_to": "your_email@qq.com"
+}

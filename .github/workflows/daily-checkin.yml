@@ -1,0 +1,47 @@
+name: WorkBuddy 每日签到
+
+on:
+  schedule:
+    # ⚠️ GitHub Actions 的 cron 使用 UTC 时间！北京时间 = UTC + 8
+    # 01:00 UTC = 北京时间 09:00（主触发）
+    - cron: '0 1 * * *'
+    # 04:00 UTC = 北京时间 12:00（兜底：GitHub 定时可能延迟，接口幂等，重复执行不会重复领取）
+    - cron: '0 4 * * *'
+  workflow_dispatch: {}   # 允许在 Actions 页面手动触发
+
+permissions:
+  contents: read
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    # 单账号串行：同一时刻只允许一个签到任务在跑，杜绝并发
+    concurrency:
+      group: wb-checkin
+      cancel-in-progress: false
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 执行签到
+        env:
+          # ---- WorkBuddy 凭证（必填）----
+          WB_ACCESS_TOKEN:  ${{ secrets.WB_ACCESS_TOKEN }}
+          WB_REFRESH_TOKEN: ${{ secrets.WB_REFRESH_TOKEN }}
+          WB_DOMAIN:        ${{ secrets.WB_DOMAIN }}          # 可选，默认 www.workbuddy.cn
+
+          # ---- 邮件告警（可选，不配则只写日志）----
+          SMTP_HOST:        ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:        ${{ secrets.SMTP_PORT }}
+          SMTP_USER:        ${{ secrets.SMTP_USER }}
+          SMTP_PASS:        ${{ secrets.SMTP_PASS }}
+          ALERT_TO:         ${{ secrets.ALERT_TO }}
+        run: python checkin.py

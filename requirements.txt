@@ -1,0 +1,7 @@
+# 本程序零第三方依赖，仅使用 Python 3 标准库
+# （urllib / json / smtplib / base64 / argparse / email）
+# 要求 Python >= 3.7
+#
+# 如需在 GitHub Actions 之外运行：
+#   python3 --version        # 确认 >= 3.7
+#   python3 checkin.py --check-only
