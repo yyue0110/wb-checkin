@@ -37,7 +37,7 @@ USER_AGENT = "%s/%s" % (APP_NAME, VERSION)
 DEFAULT_DOMAIN = "www.workbuddy.cn"
 PATH_STATUS = "/v2/billing/meter/checkin-activity-status"
 PATH_CHECKIN = "/v2/billing/meter/daily-checkin"
-PATH_REFRESH = "/v2/auth/token/refresh"
+PATH_REFRESH = "/v2/plugin/auth/token/refresh"   # 注意有 /plugin 前缀（已实测：不带前缀返回 404）
 
 # 接口返回码
 CODE_OK = 0
@@ -52,12 +52,15 @@ ACCESS_REFRESH_MARGIN = 7 * 86400     # access token 剩余不足 7 天时，尝
 EXPIRE_WARN_MARGIN = 21 * 86400       # 凭证剩余不足 21 天时，邮件提醒重新抓取
 
 # 关于自动续期（重要，已实测）：
-#   1) 客户端内嵌的 /v2/auth/token/refresh 在网关上返回 404，不可用；
-#   2) Keycloak 标准端点 /auth/realms/copilot/protocol/openid-connect/token
-#      的 console 客户端是 confidential 客户端，需 client secret，第三方无法调用。
-#   因此本脚本采用「长周期 token + 提前邮件提醒」策略：
-#   access token 有效期约 60 天，脚本会在到期前 21 天开始邮件提醒，
-#   你只需每两个月重跑一次取 token 的命令即可。
+#   客户端真正使用的路径是 /v2/plugin/auth/token/refresh（网关前缀是 /plugin）。
+#   之前误用 /v2/auth/token/refresh 才会 404。实测该路由：
+#       - 不要求有效的 Authorization（用无效 access + 伪 refresh 探测，返回
+#         401 {"code":12153,"msg":"refresh token failed"} 而非 404），
+#       - 需要请求头 X-Refresh-Token 与 X-Auth-Refresh-Source: plugin。
+#   因此：只要能拿到一个**有效的 refresh token**，就能长期自动续期。
+#   请注意：客户端自身也会刷新，且每次刷新都会轮换 refresh token，
+#   因此刷新成功后必须把新 token 写回状态文件（Actions 用 actions/cache 持久化），
+#   否则缓存丢失时会回退到已失效的旧 token。
 
 CN_TZ = timezone(timedelta(hours=8))
 
@@ -282,8 +285,16 @@ def extract_auth(obj):
         cands.append(d)
     cands.append(obj)
     for c in cands:
-        if isinstance(c, dict) and c.get("accessToken"):
-            return c
+        if not isinstance(c, dict):
+            continue
+        at = c.get("accessToken") or c.get("access_token")
+        if at:
+            norm = dict(c)
+            norm["accessToken"] = at
+            rt = c.get("refreshToken") or c.get("refresh_token")
+            if rt:
+                norm["refreshToken"] = rt
+            return norm
     return None
 
 
@@ -292,9 +303,12 @@ def try_refresh(cfg, refresh_token, access_token):
     if not refresh_token:
         log("缺少 refresh token，无法刷新", "WARN")
         return None
-    headers = cfg.auth_headers(access_token)
-    headers["X-Refresh-Token"] = refresh_token
-    headers["X-Auth-Refresh-Source"] = "plugin"
+    # 刷新时 access token 往往已失效，不带 Authorization 以免网关先行拦截
+    # （实测该路由不依赖 Authorization，仅认 X-Refresh-Token）
+    headers = {
+        "X-Refresh-Token": refresh_token,
+        "X-Auth-Refresh-Source": "plugin",
+    }
     log("尝试刷新 access token（当前 %s）" % mask(access_token))
     resp = http_post_json(api_url(cfg, PATH_REFRESH), headers, {}, retries=2)
     if not resp["ok"]:

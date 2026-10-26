@@ -13,7 +13,7 @@
 3. **严格遵守单账号、低频、串行**。本脚本设计就是：单账号、每天 1 次、串行请求、请求间隔 ≥1 秒、失败最多重试 3 次。**请勿改成多账号、并发、批量领取**，那会显著提高被风控的概率。
 4. **凭证等同账号密码**。`accessToken` 可以完全代表你的账号身份，只存放在 GitHub Secrets 或本地 `config.json`（已被 `.gitignore` 忽略），**绝不要提交进版本库、不要发给别人、不要贴进日志**。
 5. **频率控制参数是硬性约定**，`MAX_RETRIES`、`GAP_BETWEEN_CALLS` 不要调高。
-6. **凭证有有效期**。实测 access token 有效期约 60 天，且当前**没有可用的自动续期接口**（详见下文「凭证有效期」）。脚本会在到期前 21 天开始发邮件提醒你，你需要每两个月重跑一次取 token 的命令。
+6. **凭证有有效期，且会被客户端"轮换失效"**。实测 access token 有效期约 60 天，但**客户端每次自动刷新登录态都会把旧 token 在服务端吊销**——即使 JWT 还没到期也会返回 401。脚本会自动尝试 `/v2/plugin/auth/token/refresh` 续期（需要有效的 refresh token）；若续期失败，就需要重新抓一次凭证。
 
 ---
 
@@ -148,7 +148,7 @@ git push -u origin main
 |---|---|---|
 | `WB_ACCESS_TOKEN` | ✅（二选一） | 第一步复制的 Bearer token（不含 `Bearer ` 前缀） |
 | `WB_COOKIE` | ✅（二选一） | 第一步复制的 Cookie 值，没有 Bearer 时使用 |
-| `WB_REFRESH_TOKEN` | ⬜ | refresh token，当前无法用于自动续期，有则一并保存 |
+| `WB_REFRESH_TOKEN` | ⬜ | refresh token。**强烈建议提供**——有它脚本才能调 `/v2/plugin/auth/token/refresh` 自动续期 |
 | `WB_DOMAIN` | ⬜ | 接口域名，默认 `www.workbuddy.cn`，一般不用填 |
 | `SMTP_HOST` | ⬜ | 邮件服务器，如 `smtp.qq.com` / `smtp.163.com` |
 | `SMTP_PORT` | ⬜ | `465`（SSL）或 `587`（STARTTLS），默认 465 |
@@ -192,12 +192,16 @@ git push -u origin main
 
 实测结论：
 
-- access token 有效期 **60 天**；脚本会在剩余不足 **21 天**时开始每天发邮件提醒。
-- **没有可用的自动续期**，两条路都实测不通：
-  - 客户端内嵌的 `/v2/auth/token/refresh` 在网关上返回 **404**；
-  - Keycloak 标准端点 `/auth/realms/copilot/protocol/openid-connect/token` 的 `console` 客户端是 confidential 客户端，**需要 client secret**，第三方无法调用。
-- 所以：**每隔一段时间重跑一次「第一步」，更新 `WB_ACCESS_TOKEN`（或 `WB_COOKIE`）即可**，约 1 分钟。脚本本身保留了对刷新接口的尽力而为探测，哪天服务端开放了就能自动续期。
-- 有效期参考（2026-10 实测）：网页端签发约 **28 天**，旧客户端版约 **60 天**。**建议按 20 天一轮更新**，别等到脚本告警或彻底失效。
+- access token 有效期 **60 天**（网页端签发约 28 天）。
+- **真正会导致失效的不是到期，而是客户端的自动轮换**：客户端每次刷新登录态，都会把旧 access token 在服务端吊销。所以会出现"JWT 显示还剩 12 天、接口却返回 401"的情况。2026-10-24 那次连续失败就是这个原因。
+- **自动续期接口是存在的，路径是 `/v2/plugin/auth/token/refresh`**（网关前缀 `/plugin`，之前用 `/v2/auth/token/refresh` 才会 404）。请求方式：
+  - `POST /v2/plugin/auth/token/refresh`，body `{}`
+  - 请求头：`X-Refresh-Token: <refreshToken>`、`X-Auth-Refresh-Source: plugin`
+  - **不需要**有效的 `Authorization`（刷新时 access 通常已失效）
+  - 已实测该路由存在：用伪 refresh token 请求返回 `401 {"code":12153,"msg":"refresh token failed..."}`，而不是 404。
+- 因此：**只要能拿到一个有效的 `refreshToken`，脚本就能长期自动续期**。刷新成功后新 token 会写入 `state/token.json`，Actions 用 `actions/cache` 持久化。
+- 但请注意：**客户端自己也在刷新并轮换 refresh token**。如果客户端先刷新，你手里的 refresh token 就会失效。所以 refresh token 不是"永久"的，只是能显著拉长周期。
+- 兜底策略不变：一旦 401 且刷新失败，就重新跑「第一步」抓一次凭证，更新 `WB_ACCESS_TOKEN` / `WB_REFRESH_TOKEN`。
 
 ### 提醒：凭证临期时脚本的行为
 
