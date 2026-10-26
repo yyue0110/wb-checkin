@@ -3,12 +3,15 @@
 
   "domain": "www.workbuddy.cn",
 
+  "_cred_comment": "凭证二选一：access_token（Bearer）优先，留空时自动使用 cookie。两者都填则以 Bearer 为准。",
   "access_token": "",
   "refresh_token": "",
+  "cookie": "",
   "uid": "",
 
   "state_file": "",
 
+  "_smtp_comment": "邮件告警可选。整组留空则完全不发信，只在日志里记录。删除对应的 GitHub Secret 同样可以静音。",
   "smtp_host": "smtp.qq.com",
   "smtp_port": 465,
   "smtp_user": "your_email@qq.com",

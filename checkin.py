@@ -66,13 +66,17 @@ CN_TZ = timezone(timedelta(hours=8))
 # 基础工具
 # --------------------------------------------------------------------------
 def mask(secret, head=6, tail=4):
-    """token 脱敏：只保留前 6 后 4。"""
+    """token 脱敏：只保留前 head 后 tail。
+
+    注意 tail 传 0 时不能写成 s[-0:]（Python 里 -0 == 0，会返回整个字符串），
+    否则 Cookie 这类「只留前缀」的场景会把原文泄漏到日志里。
+    """
     if not secret:
         return "<empty>"
     s = str(secret)
     if len(s) <= head + tail:
         return "*" * len(s)
-    return "%s****%s" % (s[:head], s[-tail:])
+    return s[:head] + "****" + (s[-tail:] if tail else "")
 
 
 def now_cn():
@@ -155,6 +159,11 @@ class Config(object):
         self.refresh_token = (env.get("WB_REFRESH_TOKEN") or file_cfg.get("refresh_token") or "").strip()
         self.uid = (env.get("WB_UID") or file_cfg.get("uid") or "").strip()
 
+        # Cookie 备选凭证：Bearer token 不可用时的第二条路。
+        # 网页端（www.workbuddy.cn 登录后的 XHR 请求）携带的通常就是 Cookie，
+        # 客户端导出 Bearer 失败时可以用它顶上。
+        self.cookie = (env.get("WB_COOKIE") or file_cfg.get("cookie") or "").strip()
+
         self.state_path = env.get("WB_STATE_FILE") or file_cfg.get("state_file") \
             or os.path.join(self.script_dir, "state", "token.json")
 
@@ -170,6 +179,21 @@ class Config(object):
     @property
     def mail_ready(self):
         return all([self.smtp_host, self.smtp_user, self.smtp_pass, self.alert_to])
+
+    def auth_headers(self, token):
+        """构造鉴权头。Bearer token 优先，缺失时回退到 Cookie。"""
+        headers = {}
+        if token:
+            headers["Authorization"] = "Bearer %s" % token
+        if self.cookie:
+            headers["Cookie"] = self.cookie
+        return headers
+
+    def describe_cred(self):
+        """凭证概要（脱敏），用于日志。"""
+        if self.cookie:
+            return "Cookie(%s)" % mask(self.cookie, 12, 0)
+        return "Bearer(%s)" % mask(self.access_token)
 
 
 # --------------------------------------------------------------------------
@@ -238,10 +262,6 @@ def http_post_json(url, headers, payload, retries=MAX_RETRIES):
     return last
 
 
-def auth_headers(token):
-    return {"Authorization": "Bearer %s" % token}
-
-
 def api_url(cfg, path):
     return cfg.domain + path
 
@@ -272,7 +292,7 @@ def try_refresh(cfg, refresh_token, access_token):
     if not refresh_token:
         log("缺少 refresh token，无法刷新", "WARN")
         return None
-    headers = auth_headers(access_token)
+    headers = cfg.auth_headers(access_token)
     headers["X-Refresh-Token"] = refresh_token
     headers["X-Auth-Refresh-Source"] = "plugin"
     log("尝试刷新 access token（当前 %s）" % mask(access_token))
@@ -289,12 +309,12 @@ def try_refresh(cfg, refresh_token, access_token):
 
 
 def query_status(cfg, token):
-    resp = http_post_json(api_url(cfg, PATH_STATUS), auth_headers(token), {})
+    resp = http_post_json(api_url(cfg, PATH_STATUS), cfg.auth_headers(token), {})
     return resp
 
 
 def do_checkin(cfg, token):
-    resp = http_post_json(api_url(cfg, PATH_CHECKIN), auth_headers(token), {})
+    resp = http_post_json(api_url(cfg, PATH_CHECKIN), cfg.auth_headers(token), {})
     return resp
 
 
@@ -387,23 +407,28 @@ def main(argv=None):
     state = read_json_file(cfg.state_path)
     access = (state.get("accessToken") or "").strip() or cfg.access_token
     refresh = (state.get("refreshToken") or "").strip() or cfg.refresh_token
+    cookie = (state.get("cookie") or "").strip() or cfg.cookie
 
-    if not access:
-        log("未找到 access token。请设置环境变量 WB_ACCESS_TOKEN 或填写 config.json", "ERROR")
+    if not access and not cookie:
+        log("未找到任何凭证。请设置环境变量 WB_ACCESS_TOKEN 或 WB_COOKIE", "ERROR")
         finish("error", "登录凭证缺失，未执行任何请求", cfg=cfg, notify=True,
                subject="[WB签到] 失败：缺少登录凭证",
-               extra={"hint": "重新抓取 workbuddy-desktop.info 里的 accessToken 并更新 Secret"})
+               extra={"hint": "用浏览器 F12 复制 Authorization 或 Cookie，更新仓库 Secret"})
 
-    log("使用 access token %s（来源：%s）" %
-        (mask(access), "缓存状态" if state.get("accessToken") else "环境变量/配置文件"))
+    if access:
+        log("使用 access token %s（来源：%s）" %
+            (mask(access), "缓存状态" if state.get("accessToken") else "环境变量/配置文件"))
+    else:
+        log("使用 Cookie %s（来源：%s）" %
+            (mask(cookie, 12, 0), "缓存状态" if state.get("cookie") else "环境变量/配置文件"))
 
     warnings = []
     refreshed_in_this_run = False
 
     # ---------- 2. token 有效期检查（含提前告警与尽力而为的续期） ----------
     now_ts = int(time.time())
-    acc_exp = jwt_exp(access)
-    if acc_exp:
+    acc_exp = jwt_exp(access) if access else None
+    if acc_exp is not None:
         left = acc_exp - now_ts
         exp_str = datetime.fromtimestamp(acc_exp, CN_TZ).strftime("%Y-%m-%d %H:%M")
         log("access token 剩余有效期：%d 天（到期 %s）" % (max(left // 86400, 0), exp_str))
@@ -412,8 +437,8 @@ def main(argv=None):
             log(detail, "ERROR")
             finish("error", detail, cfg=cfg, notify=True,
                    subject="[WB签到] 失败：登录凭证已过期",
-                   extra={"token": mask(access), "expire_at": exp_str,
-                          "hint": "重跑 README 中的取 token 命令，更新 WB_ACCESS_TOKEN"})
+                   extra={"credential": cfg.describe_cred(), "expire_at": exp_str,
+                          "hint": "用浏览器 F12 重新抓取凭证，更新 WB_ACCESS_TOKEN 或 WB_COOKIE Secret"})
         if left < EXPIRE_WARN_MARGIN:
             warnings.append("access token 将在 %d 天后过期（%s），请尽快重新抓取并更新凭证"
                             % (max(left // 86400, 0), exp_str))
@@ -433,8 +458,11 @@ def main(argv=None):
                 warnings = []  # 续期成功，撤销过期告警
             else:
                 warnings.append("尝试自动续期失败（服务端未提供可用的刷新接口），请手动更新凭证")
+    elif access:
+        warnings.append("无法解析 access token 有效期（token 格式可能已变化，过期时脚本不会再提前预警）")
     else:
-        warnings.append("无法解析 access token 有效期（接口或 token 格式可能已变化）")
+        # Cookie 凭证无法本地预判过期时间，只能等服务端返回 401/403 才能感知
+        warnings.append("当前使用 Cookie 凭证，无法预判有效期；一旦服务端拒绝请重新抓取 Cookie")
 
     ref_exp = jwt_exp(refresh)
     if ref_exp:
@@ -469,7 +497,7 @@ def main(argv=None):
         finish("error", detail, cfg=cfg, notify=True,
                subject="[WB签到] 失败：状态查询异常",
                extra={"http": resp["http"], "attempts": resp["attempts"],
-                      "token": mask(access), "warnings": warnings})
+                      "credential": cfg.describe_cred(), "warnings": warnings})
 
     if args.verbose:
         log("status 原始返回：%s" % json.dumps(resp["data"], ensure_ascii=False), "DEBUG")
@@ -603,7 +631,7 @@ def main(argv=None):
         "daily_credit": daily_credit,
         "season": season,
         "activity": activity,
-        "token": mask(access),
+        "credential": cfg.describe_cred(),
         "warnings": warnings,
     }
 

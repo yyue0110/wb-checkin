@@ -1,6 +1,8 @@
 # WorkBuddy「Buddy 加油站」每日自动签到
 
-一个零第三方依赖的 Python 脚本，配合 GitHub Actions 定时任务，**每天自动领取 WorkBuddy 加油站的免费积分**，本地电脑关机也不受影响。失败或凭证过期时自动发邮件提醒。
+一个零第三方依赖的 Python 脚本，配合 GitHub Actions 定时任务，**每天自动领取 WorkBuddy 加油站的免费积分**，本地电脑关机也不受影响。支持 `Bearer token` 与 `Cookie` 两种凭证；邮件告警可选，删掉对应 Secret 即可静音。
+
+> **2026-10 更新**：新版 WorkBuddy 客户端已把登录态改为加密存储（AES-GCM + ACL 校验），本 README 早期版本写的「从 `workbuddy-desktop.info` 提取明文 token」已失效。领取凭证请改用下面的**浏览器 F12 方式**。
 
 ---
 
@@ -45,43 +47,49 @@ wb-checkin/
 
 ---
 
-## 第一步：获取凭证（在本机执行）
+## 第一步：获取凭证（浏览器 F12，约 1 分钟）
 
-WorkBuddy 客户端会把登录态以明文 JSON 存在本机。请**先确保客户端已登录**。
+### 为什么不用本机登录态文件了
 
-文件路径：`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`
+旧版客户端把 token 明文存在
+`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`，
+可以直接读出来。但新版改成了：
 
-### 方式 A：PowerShell（推荐，token 直接进剪贴板，屏幕只显示脱敏形态）
-
-```powershell
-$p = "$env:LOCALAPPDATA\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info"
-$o = Get-Content $p -Raw | ConvertFrom-Json
-$at = $o.auth.accessToken
-$rt = $o.auth.refreshToken
-$m = { param($t) "$($t.Substring(0,6))****$($t.Substring($t.Length-4))" }
-Write-Host "ACCESS :" (& $m $at)
-Write-Host "REFRESH:" (& $m $rt)
-Write-Host "DOMAIN :" $o.auth.domain
-"$at`n$rt" | Set-Clipboard
-Write-Host "完整 token 已复制到剪贴板（第一行 access，第二行 refresh）"
+```json
+"accessToken": { "$wbEncrypted": 1, "envelope": "eyJzdWl0ZSI6..." }
 ```
 
-### 方式 B：Git Bash / macOS / Linux
+`envelope` 解出来是 `{"suite":1,"keyId":"...","nonce":"...","ciphertext":"..."}`，密钥由客户端内部持有（`oauth-master-key`）并且配套 ACL 文件权限校验（`verifyFileAcl` / `tryRepairAcl`），第三方脚本读不到。所以**改走浏览器这条路，反而更简单也更稳**。
+
+### 操作步骤（Edge / Chrome 通用）
+
+1. 打开 **https://www.workbuddy.cn** 并登录（微信扫码或手机号）。
+2. 按 **F12** 打开开发者工具 → 切到 **网络 / Network** 面板。
+3. 勾上 **保留日志 / Preserve log**；筛选框输入 `v2`。
+4. 在页面上点进**加油站**（或刷新页面），触发几条 XHR 请求。
+5. 在请求列表里点任意一条 `v2/` 开头的请求（最好就是 `checkin-activity-status`）。
+6. 右侧 → **标头 / Headers** → 往下滚动到 **请求标头 / Request Headers**。
+7. 复制其中一项（**右键 → Copy value**，别手动拖选，容易截断）：
+
+   | 看到的字段 | 复制的内容 | 对应 Secret |
+   |---|---|---|
+   | `Authorization: Bearer eyJhbGciOiJSUzI1NiIs...` | **只复制 `Bearer ` 后面那一长串** | `WB_ACCESS_TOKEN`（推荐） |
+   | 没有 Authorization，只有 `Cookie: abc=1; def=2; ...` | 整段 Cookie 值（不含 `Cookie: `） | `WB_COOKIE` |
+
+   两者二选一即可，脚本会优先用 `WB_ACCESS_TOKEN`，没有时自动回退到 `WB_COOKIE`。
+
+> ⚠️ token 通常有几百到上千字符，**务必复制完整**，截断会导致 401。
+> ⚠️ 全程不要把凭证打印到终端、贴进聊天窗口或发给别人。
+
+### 顺手测一下（本机即可，只查不领）
 
 ```bash
-AUTH="$LOCALAPPDATA/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info"
-PY="C:/Users/Administrator/.workbuddy/binaries/python/versions/3.13.12/python.exe"   # 改成你的 python
-"$PY" -c "
-import json
-d=json.load(open(r'$AUTH',encoding='utf-8'))['auth']
-a,r=d['accessToken'],d['refreshToken']
-print('ACCESS :',a[:6]+'****'+a[-4:]); print('REFRESH:',r[:6]+'****'+r[-4:]); print('DOMAIN :',d['domain'])
-open('/tmp/wb_token.txt','w').write(a+'\n'+r+'\n')
-print('完整 token 已写入 /tmp/wb_token.txt')
-"
+cd wb-checkin
+export WB_ACCESS_TOKEN='粘贴你复制的那串'      # 或用 WB_COOKIE='...'
+python checkin.py --check-only                 # 只查状态，绝不发起领取请求
 ```
 
-> 全程不要把完整 token 打印到终端或贴到聊天窗口。
+看到 `[INFO] 今日是否已领取：...` 就说明凭证有效、接口连通。
 
 ---
 
@@ -89,11 +97,13 @@ print('完整 token 已写入 /tmp/wb_token.txt')
 
 ```bash
 cd wb-checkin
-cp config.example.json config.json      # 然后填入上一步拿到的 token；或直接用环境变量
+cp config.example.json config.json      # 或直接用环境变量（推荐，不留文件）
 
-# 用环境变量（更推荐，不留文件）
+# Bearer 凭证
 export WB_ACCESS_TOKEN='粘贴 access token'
-export WB_REFRESH_TOKEN='粘贴 refresh token'
+
+# 或者 Cookie 凭证（二选一）
+export WB_COOKIE='粘贴 cookie'
 
 python checkin.py --check-only          # 只查状态，绝不发起领取请求
 python checkin.py --dry-run             # 走完整流程但不发领取请求
@@ -136,8 +146,9 @@ git push -u origin main
 
 | Secret 名 | 必填 | 说明 |
 |---|---|---|
-| `WB_ACCESS_TOKEN` | ✅ | 第一步拿到的 access token |
-| `WB_REFRESH_TOKEN` | ✅ | 第一步拿到的 refresh token（当前无法用于自动续期，但请一并保存） |
+| `WB_ACCESS_TOKEN` | ✅（二选一） | 第一步复制的 Bearer token（不含 `Bearer ` 前缀） |
+| `WB_COOKIE` | ✅（二选一） | 第一步复制的 Cookie 值，没有 Bearer 时使用 |
+| `WB_REFRESH_TOKEN` | ⬜ | refresh token，当前无法用于自动续期，有则一并保存 |
 | `WB_DOMAIN` | ⬜ | 接口域名，默认 `www.workbuddy.cn`，一般不用填 |
 | `SMTP_HOST` | ⬜ | 邮件服务器，如 `smtp.qq.com` / `smtp.163.com` |
 | `SMTP_PORT` | ⬜ | `465`（SSL）或 `587`（STARTTLS），默认 465 |
@@ -145,11 +156,13 @@ git push -u origin main
 | `SMTP_PASS` | ⬜ | **邮箱授权码**（不是登录密码） |
 | `ALERT_TO` | ⬜ | 收件邮箱，可与发信邮箱相同 |
 
-**邮箱授权码获取**：
-- QQ 邮箱：设置 → 账户 → POP3/IMAP/SMTP 服务 → 开启 → 生成授权码
-- 163 邮箱：设置 → POP3/SMTP/IMAP → 开启 SMTP → 获取授权码
+**邮件告警是完全可选的。** 只要你把 `SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS / ALERT_TO` 这 5 个 Secret 全部删掉，脚本就会彻底静音 —— 代码里的 `mail_ready` 判断任一字段缺失即跳过发信，只在日志里留一行 `邮件未配置完整…跳过发信`。**不用改代码、不用重新推送。**
 
-不配邮件也能跑，只是失败时不会有邮件提醒（GitHub 本身会在工作流失败时发一封邮件）。
+此时仍有兜底：失败时脚本以非零码退出，GitHub 工作流标红并会通知你的 GitHub 账号邮箱。
+
+如果哪天想恢复邮件，把这 5 个 Secret 补回去即可。
+- **QQ 邮箱**：设置 → 账号与安全 → POP3/IMAP/SMTP 服务 → **先「开启服务」再「生成授权码」**（两个按钮是分开的），得到 16 位字母。免费，不是订阅。
+- **163 邮箱**：设置 → POP3/SMTP/IMAP → 开启 SMTP → 获取授权码。
 
 ### 3.3 启用定时任务
 
@@ -172,7 +185,7 @@ git push -u origin main
 - **结果含义**：
   - `success / claimed` —— 本次领取成功
   - `skipped / skip_already_signed` —— 今天已领取，跳过（正常，不发邮件）
-  - `error` —— 失败，会发告警邮件，GitHub 工作流也会标红
+  - `error` —— 失败，工作流标红（配了邮件才会额外发信）
 - **改时间**：编辑 `.github/workflows/daily-checkin.yml` 里的 cron，提交后自动生效。
 
 ### 凭证有效期与续期（重要）
@@ -180,10 +193,15 @@ git push -u origin main
 实测结论：
 
 - access token 有效期 **60 天**；脚本会在剩余不足 **21 天**时开始每天发邮件提醒。
-- **当前没有可用的自动续期方案**，两条路都实测不通：
+- **没有可用的自动续期**，两条路都实测不通：
   - 客户端内嵌的 `/v2/auth/token/refresh` 在网关上返回 **404**；
   - Keycloak 标准端点 `/auth/realms/copilot/protocol/openid-connect/token` 的 `console` 客户端是 confidential 客户端，**需要 client secret**，第三方无法调用。
-- 所以：**每两个月重跑一次「第一步」的取 token 命令，更新 `WB_ACCESS_TOKEN` 和 `WB_REFRESH_TOKEN` 两个 Secret 即可**，约 1 分钟。脚本本身保留了对刷新接口的尽力而为探测，哪天服务端开放了就能自动续期。
+- 所以：**每隔一段时间重跑一次「第一步」，更新 `WB_ACCESS_TOKEN`（或 `WB_COOKIE`）即可**，约 1 分钟。脚本本身保留了对刷新接口的尽力而为探测，哪天服务端开放了就能自动续期。
+- 有效期参考（2026-10 实测）：网页端签发约 **28 天**，旧客户端版约 **60 天**。**建议按 20 天一轮更新**，别等到脚本告警或彻底失效。
+
+### 提醒：凭证临期时脚本的行为
+
+`Bearer` 凭证脚本能自己解析 JWT 的 exp，剩余不足 **21 天**会在日志里给出 WARN 并通过邮件提醒（若配置了邮件）。`Cookie` 凭证无法本地预判有效期，**只有服务端返回 401/403 时才会暴露** —— 所以用 Cookie 的话更要留意 Actions 的运行结果。
 
 > 可选增强：如果你本机装了 `gh` CLI，可以加一个 Windows 计划任务，在开机时自动执行
 > `gh secret set WB_ACCESS_TOKEN --repo <user>/wb-checkin --body-file <token文件>`
@@ -218,11 +236,20 @@ A：不是。说明今天已经领过了（手动领或脚本领都算），脚�
 **Q：HTTP 404？**
 A：域名错了。必须用 `www.workbuddy.cn`，网上有些文章写的 `copilot.tencent.com` 会 404。
 
+**Q：邮件怎么彻底关掉？**
+A：删掉 5 个 SMTP Secret 就行（Settings → Secrets）。代码不用改，也不用重新推送。此时工作流失败仍会让 GitHub 通知你的 GitHub 账号邮箱。
+
 **Q：邮件没收到？**
-A：四个邮件变量必须全部配置才会发信；只在工作流失败或有凭证告警时发。可以用 `--notify-on-success` 强制每次都发来测试。
+A：四个邮件变量（`SMTP_HOST`/`SMTP_USER`/`SMTP_PASS`/`ALERT_TO`）必须全部存在才会发信；只在失败或有凭证告警时发。想测试通道可以用 `--notify-on-success` 强制每次都发。
 
 **Q：鉴权失败（HTTP 401）？**
-A：token 过期或客户端重新登录过导致旧 token 失效。重跑第一步更新 Secret。
+A：凭证过期。重跑「第一步」用浏览器 F12 重新取一次，更新 `WB_ACCESS_TOKEN` 或 `WB_COOKIE`。
+
+**Q：F12 里找不到 Authorization？**
+A：用 Cookie 也行，脚本两种都支持。把 `Cookie:` 那一行的值整个复制，填到 `WB_COOKIE` 即可。
+
+**Q：本机 `workbuddy-desktop.info` 里的 token 还能用吗？**
+A：新版客户端已把它改成加密存储（`$wbEncrypted` + `envelope`），第三方读不出来。这也是为什么 README 改用浏览器 F12 这条路。
 
 **Q：接口哪天突然失败了？**
 A：先本地 `python checkin.py --check-only --verbose` 看原始返回，多半是接口或字段变了，按新返回调整 `checkin.py` 里的解析即可。

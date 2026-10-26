@@ -34,8 +34,9 @@ jobs:
       - name: 执行签到
         env:
           # ---- WorkBuddy 凭证（必填）----
-          WB_ACCESS_TOKEN:  ${{ secrets.WB_ACCESS_TOKEN }}
+          WB_ACCESS_TOKEN:  ${{ secrets.WB_ACCESS_TOKEN }}   # Bearer token 与 Cookie 二选一
           WB_REFRESH_TOKEN: ${{ secrets.WB_REFRESH_TOKEN }}
+          WB_COOKIE:        ${{ secrets.WB_COOKIE }}         # 备选凭证，可留空
           WB_DOMAIN:        ${{ secrets.WB_DOMAIN }}          # 可选，默认 www.workbuddy.cn
 
           # ---- 邮件告警（可选，不配则只写日志）----
