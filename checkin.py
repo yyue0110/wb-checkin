@@ -179,16 +179,25 @@ class Config(object):
         self.mail_from = (env.get("SMTP_FROM") or file_cfg.get("smtp_from")
                           or self.smtp_user or self.alert_to).strip()
 
+        # 默认静默：邮件告警必须显式开启（WB_ALERT_ENABLED=1）才会发送。
+        # 即使 SMTP 配置齐全，不开启也绝不发信。
+        flag = env.get("WB_ALERT_ENABLED")
+        if flag is None:
+            flag = file_cfg.get("alert_enabled")
+        self.alert_enabled = str(flag if flag is not None else "").strip().lower() \
+            in ("1", "true", "yes", "on")
+
     @property
     def mail_ready(self):
-        return all([self.smtp_host, self.smtp_user, self.smtp_pass, self.alert_to])
+        return self.alert_enabled and all(
+            [self.smtp_host, self.smtp_user, self.smtp_pass, self.alert_to])
 
     def auth_headers(self, token):
-        """构造鉴权头。Bearer token 优先，缺失时回退到 Cookie。"""
+        """构造鉴权头。Bearer token 优先；没有 token 时才回退到 Cookie。"""
         headers = {}
         if token:
             headers["Authorization"] = "Bearer %s" % token
-        if self.cookie:
+        elif self.cookie:
             headers["Cookie"] = self.cookie
         return headers
 
@@ -345,7 +354,7 @@ def is_temp_error(resp):
 # --------------------------------------------------------------------------
 def send_alert(cfg, subject, body):
     if not cfg.mail_ready:
-        log("邮件未配置完整（SMTP_HOST/SMTP_USER/SMTP_PASS/ALERT_TO），跳过发信：%s" % subject, "WARN")
+        log("邮件告警未启用（默认静默）或配置不完整，跳过发信：%s" % subject, "INFO")
         return False
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = Header(subject, "utf-8")
@@ -417,11 +426,28 @@ def main(argv=None):
     cfg = Config(args)
     log("%s %s 启动（域名 %s，时区 UTC+8）" % (APP_NAME, VERSION, cfg.domain))
 
-    # ---------- 1. 载入 token（缓存状态优先，回退环境变量/配置文件） ----------
+    # ---------- 1. 载入 token（缓存状态优先，但过期缓存让位给环境变量） ----------
     state = read_json_file(cfg.state_path)
-    access = (state.get("accessToken") or "").strip() or cfg.access_token
-    refresh = (state.get("refreshToken") or "").strip() or cfg.refresh_token
+    start_ts = int(time.time())
+    state_access = (state.get("accessToken") or "").strip()
+    state_refresh = (state.get("refreshToken") or "").strip()
+    state_exp = jwt_exp(state_access) if state_access else None
+
+    # 缓存里的 access token 已过期时，不再用它覆盖环境变量/配置文件里的新凭证，
+    # 否则本地更新了 Secrets 也会被旧缓存带回 401。
+    use_state = bool(state_access) and (state_exp is None or state_exp > start_ts)
+    if state_access and not use_state and cfg.access_token:
+        log("缓存中的 access token 已过期，改用环境变量/配置文件中的凭证", "WARN")
+
+    access = state_access if use_state else cfg.access_token
+    # refresh token 同样可能被客户端轮换：优先用缓存中最新的，其次才是 Secrets 里的
+    ref_exp_ts = jwt_exp(state_refresh) if state_refresh else None
+    state_refresh_ok = bool(state_refresh) and (ref_exp_ts is None or ref_exp_ts > start_ts)
+    refresh = (state_refresh if (use_state and state_refresh_ok) else "") \
+        or cfg.refresh_token or state_refresh
     cookie = (state.get("cookie") or "").strip() or cfg.cookie
+    access_source = "缓存状态" if access is state_access and state_access else "环境变量/配置文件"
+    cookie_source = "缓存状态" if state.get("cookie") else "环境变量/配置文件"
 
     if not access and not cookie:
         log("未找到任何凭证。请设置环境变量 WB_ACCESS_TOKEN 或 WB_COOKIE", "ERROR")
@@ -430,11 +456,9 @@ def main(argv=None):
                extra={"hint": "用浏览器 F12 复制 Authorization 或 Cookie，更新仓库 Secret"})
 
     if access:
-        log("使用 access token %s（来源：%s）" %
-            (mask(access), "缓存状态" if state.get("accessToken") else "环境变量/配置文件"))
+        log("使用 access token %s（来源：%s）" % (mask(access), access_source))
     else:
-        log("使用 Cookie %s（来源：%s）" %
-            (mask(cookie, 12, 0), "缓存状态" if state.get("cookie") else "环境变量/配置文件"))
+        log("使用 Cookie %s（来源：%s）" % (mask(cookie, 12, 0), cookie_source))
 
     warnings = []
     refreshed_in_this_run = False
@@ -446,20 +470,11 @@ def main(argv=None):
         left = acc_exp - now_ts
         exp_str = datetime.fromtimestamp(acc_exp, CN_TZ).strftime("%Y-%m-%d %H:%M")
         log("access token 剩余有效期：%d 天（到期 %s）" % (max(left // 86400, 0), exp_str))
+
+        # 已过期：先尽力用 refresh token 续期，续期失败才报错退出
         if left <= 0:
-            detail = "access token 已于 %s 过期，请重新抓取凭证" % exp_str
-            log(detail, "ERROR")
-            finish("error", detail, cfg=cfg, notify=True,
-                   subject="[WB签到] 失败：登录凭证已过期",
-                   extra={"credential": cfg.describe_cred(), "expire_at": exp_str,
-                          "hint": "用浏览器 F12 重新抓取凭证，更新 WB_ACCESS_TOKEN 或 WB_COOKIE Secret"})
-        if left < EXPIRE_WARN_MARGIN:
-            warnings.append("access token 将在 %d 天后过期（%s），请尽快重新抓取并更新凭证"
-                            % (max(left // 86400, 0), exp_str))
-        if left < ACCESS_REFRESH_MARGIN:
-            # 尽力而为：服务端若哪天开放了刷新路由即可自动续期，失败不影响本次执行
+            log("access token 已于 %s 过期，尝试刷新续期" % exp_str, "WARN")
             new_auth = try_refresh(cfg, refresh, access)
-            refreshed_in_this_run = True
             if new_auth:
                 access = new_auth.get("accessToken") or access
                 refresh = new_auth.get("refreshToken") or refresh
@@ -469,9 +484,39 @@ def main(argv=None):
                     "domain": cfg.domain,
                     "updatedAt": now_cn().isoformat(),
                 })
+                refreshed_in_this_run = True
+                acc_exp = jwt_exp(access)
+                left = (acc_exp - now_ts) if acc_exp is not None else None
+                if left is not None:
+                    exp_str = datetime.fromtimestamp(acc_exp, CN_TZ).strftime("%Y-%m-%d %H:%M")
+                log("续期成功，新 access token = %s" % mask(access))
+            if not new_auth or (left is not None and left <= 0):
+                detail = "access token 已于 %s 过期，且刷新失败，请重新抓取凭证" % exp_str
+                log(detail, "ERROR")
+                finish("error", detail, cfg=cfg, notify=True,
+                       subject="[WB签到] 失败：登录凭证已过期",
+                       extra={"credential": cfg.describe_cred(), "expire_at": exp_str,
+                              "hint": "用浏览器 F12 重新抓取凭证，更新 WB_ACCESS_TOKEN 或 WB_COOKIE Secret"})
+
+        if left is not None and left < EXPIRE_WARN_MARGIN:
+            warnings.append("access token 将在 %d 天后过期（%s），请尽快重新抓取并更新凭证"
+                            % (max(left // 86400, 0), exp_str))
+        if left is not None and not refreshed_in_this_run and left < ACCESS_REFRESH_MARGIN:
+            # 临期自动续期（成功率取决于 refresh token 是否仍有效）
+            new_auth = try_refresh(cfg, refresh, access)
+            if new_auth:
+                access = new_auth.get("accessToken") or access
+                refresh = new_auth.get("refreshToken") or refresh
+                write_json_file(cfg.state_path, {
+                    "accessToken": access,
+                    "refreshToken": refresh,
+                    "domain": cfg.domain,
+                    "updatedAt": now_cn().isoformat(),
+                })
+                refreshed_in_this_run = True
                 warnings = []  # 续期成功，撤销过期告警
             else:
-                warnings.append("尝试自动续期失败（服务端未提供可用的刷新接口），请手动更新凭证")
+                warnings.append("尝试自动续期失败（refresh token 可能已失效），请手动更新凭证")
     elif access:
         warnings.append("无法解析 access token 有效期（token 格式可能已变化，过期时脚本不会再提前预警）")
     else:
@@ -492,8 +537,8 @@ def main(argv=None):
         log("状态查询返回登录态失效（HTTP %s），尝试刷新后重试一次" % resp["http"], "WARN")
         if not refreshed_in_this_run:
             new_auth = try_refresh(cfg, refresh, access)
-            refreshed_in_this_run = True
             if new_auth:
+                refreshed_in_this_run = True
                 access = new_auth.get("accessToken") or access
                 refresh = new_auth.get("refreshToken") or refresh
                 write_json_file(cfg.state_path, {

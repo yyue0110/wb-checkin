@@ -31,18 +31,26 @@ jobs:
         with:
           python-version: '3.11'
 
+      # 续期后的新 token 必须跨运行保留，否则每次都会从旧的 Secret 重新开始
+      - name: 恢复 token 状态
+        uses: actions/cache@v4
+        with:
+          path: state
+          key: wb-token-${{ github.run_id }}
+          restore-keys: |
+            wb-token-
+
       - name: 执行签到
         env:
-          # ---- WorkBuddy 凭证（必填）----
-          WB_ACCESS_TOKEN:  ${{ secrets.WB_ACCESS_TOKEN }}   # Bearer token 与 Cookie 二选一
+          # ---- WorkBuddy 凭证（必填，Bearer 与 Cookie 二选一）----
+          WB_ACCESS_TOKEN:  ${{ secrets.WB_ACCESS_TOKEN }}
           WB_REFRESH_TOKEN: ${{ secrets.WB_REFRESH_TOKEN }}
-          WB_COOKIE:        ${{ secrets.WB_COOKIE }}         # 备选凭证，可留空
+          WB_COOKIE:        ${{ secrets.WB_COOKIE }}
           WB_DOMAIN:        ${{ secrets.WB_DOMAIN }}          # 可选，默认 www.workbuddy.cn
 
-          # ---- 邮件告警（可选，不配则只写日志）----
-          SMTP_HOST:        ${{ secrets.SMTP_HOST }}
-          SMTP_PORT:        ${{ secrets.SMTP_PORT }}
-          SMTP_USER:        ${{ secrets.SMTP_USER }}
-          SMTP_PASS:        ${{ secrets.SMTP_PASS }}
-          ALERT_TO:         ${{ secrets.ALERT_TO }}
+          # token 状态文件：配合上面的缓存持久化刷新结果
+          WB_STATE_FILE:    state/token.json
+
+          # 邮件告警默认静默；确实需要时再配 SMTP Secret 并设置 WB_ALERT_ENABLED=1
+          # WB_ALERT_ENABLED: '1'
         run: python checkin.py

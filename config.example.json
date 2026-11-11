@@ -11,7 +11,8 @@
 
   "state_file": "",
 
-  "_smtp_comment": "邮件告警可选。整组留空则完全不发信，只在日志里记录。删除对应的 GitHub Secret 同样可以静音。",
+  "_smtp_comment": "邮件告警默认静默。整个配置留空即不发信；即使填了 SMTP，也必须把 alert_enabled 设为 true（或设置环境变量 WB_ALERT_ENABLED=1）才会发送。",
+  "alert_enabled": false,
   "smtp_host": "smtp.qq.com",
   "smtp_port": 465,
   "smtp_user": "your_email@qq.com",

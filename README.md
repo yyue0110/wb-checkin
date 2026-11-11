@@ -1,6 +1,6 @@
 # WorkBuddy「Buddy 加油站」每日自动签到
 
-一个零第三方依赖的 Python 脚本，配合 GitHub Actions 定时任务，**每天自动领取 WorkBuddy 加油站的免费积分**，本地电脑关机也不受影响。支持 `Bearer token` 与 `Cookie` 两种凭证；邮件告警可选，删掉对应 Secret 即可静音。
+一个零第三方依赖的 Python 脚本，配合 GitHub Actions 定时任务，**每天自动领取 WorkBuddy 加油站的免费积分**，本地电脑关机也不受影响。支持 `Bearer token` 与 `Cookie` 两种凭证；**默认完全静默，不发送任何邮件**（需要告警时再显式开启）。
 
 > **2026-10 更新**：新版 WorkBuddy 客户端已把登录态改为加密存储（AES-GCM + ACL 校验），本 README 早期版本写的「从 `workbuddy-desktop.info` 提取明文 token」已失效。领取凭证请改用下面的**浏览器 F12 方式**。
 
@@ -150,17 +150,20 @@ git push -u origin main
 | `WB_COOKIE` | ✅（二选一） | 第一步复制的 Cookie 值，没有 Bearer 时使用 |
 | `WB_REFRESH_TOKEN` | ⬜ | refresh token。**强烈建议提供**——有它脚本才能调 `/v2/plugin/auth/token/refresh` 自动续期 |
 | `WB_DOMAIN` | ⬜ | 接口域名，默认 `www.workbuddy.cn`，一般不用填 |
-| `SMTP_HOST` | ⬜ | 邮件服务器，如 `smtp.qq.com` / `smtp.163.com` |
+| `SMTP_HOST` | ⬜ | 仅在需要邮件告警时填写，如 `smtp.qq.com` |
 | `SMTP_PORT` | ⬜ | `465`（SSL）或 `587`（STARTTLS），默认 465 |
 | `SMTP_USER` | ⬜ | 发信邮箱完整地址 |
 | `SMTP_PASS` | ⬜ | **邮箱授权码**（不是登录密码） |
 | `ALERT_TO` | ⬜ | 收件邮箱，可与发信邮箱相同 |
+| `WB_ALERT_ENABLED` | ⬜ | 设为 `1` 才真正启用邮件告警；不设置则永远静默 |
 
-**邮件告警是完全可选的。** 只要你把 `SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS / ALERT_TO` 这 5 个 Secret 全部删掉，脚本就会彻底静音 —— 代码里的 `mail_ready` 判断任一字段缺失即跳过发信，只在日志里留一行 `邮件未配置完整…跳过发信`。**不用改代码、不用重新推送。**
+**默认就是静默的。** 即使 SMTP 配置齐全，只要没有 `WB_ALERT_ENABLED=1`，脚本也不会发任何邮件（`mail_ready` 会直接判否，日志里只留一行跳过提示）。仓库自带的工作流没有配置任何邮件变量，开箱即静默。
 
-此时仍有兜底：失败时脚本以非零码退出，GitHub 工作流标红并会通知你的 GitHub 账号邮箱。
+**需要彻底静音时无需改代码**：不配 SMTP 即可；已经配过的，把 `SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS / ALERT_TO` 删掉或删掉 `WB_ALERT_ENABLED` 都会静音。
 
-如果哪天想恢复邮件，把这 5 个 Secret 补回去即可。
+> 注意：GitHub 自身在工作流失败时可能按你的通知设置发邮件，那不属于脚本行为，可在 GitHub → Settings → Notifications 里关闭 Actions 通知。
+
+想启用邮件告警时，再加 `WB_ALERT_ENABLED=1` 并补齐 5 个 SMTP 变量：
 - **QQ 邮箱**：设置 → 账号与安全 → POP3/IMAP/SMTP 服务 → **先「开启服务」再「生成授权码」**（两个按钮是分开的），得到 16 位字母。免费，不是订阅。
 - **163 邮箱**：设置 → POP3/SMTP/IMAP → 开启 SMTP → 获取授权码。
 
@@ -176,6 +179,8 @@ git push -u origin main
 ⚠️ **GitHub Actions 的 cron 用 UTC，北京时间要减 8 小时**。想改成北京时间 08:00 就写 `0 0 * * *`。
 
 推送后到 **Actions** 页面，选 `WorkBuddy 每日签到` → **Run workflow** 手动跑一次验证全链路。
+
+> 工作流里已经用 `actions/cache` 缓存 `state/token.json`，续期后的新 token 会跨运行保留。**不要删掉那一步缓存**，否则刷新结果每次都会丢。
 
 ---
 
@@ -199,13 +204,14 @@ git push -u origin main
   - 请求头：`X-Refresh-Token: <refreshToken>`、`X-Auth-Refresh-Source: plugin`
   - **不需要**有效的 `Authorization`（刷新时 access 通常已失效）
   - 已实测该路由存在：用伪 refresh token 请求返回 `401 {"code":12153,"msg":"refresh token failed..."}`，而不是 404。
-- 因此：**只要能拿到一个有效的 `refreshToken`，脚本就能长期自动续期**。刷新成功后新 token 会写入 `state/token.json`，Actions 用 `actions/cache` 持久化。
+- 因此：**只要能拿到一个有效的 `refreshToken`，脚本就能长期自动续期**。刷新成功后新 token 会写入 `state/token.json`，Actions 用 `actions/cache` 持久化（工作流已内置，无需额外配置）。
+- access token 已过期时，脚本会**先尝试刷新、成功就继续签到**；只有刷新也失败才会报错退出。临期（不足 7 天）时也会主动续期一次。
 - 但请注意：**客户端自己也在刷新并轮换 refresh token**。如果客户端先刷新，你手里的 refresh token 就会失效。所以 refresh token 不是"永久"的，只是能显著拉长周期。
 - 兜底策略不变：一旦 401 且刷新失败，就重新跑「第一步」抓一次凭证，更新 `WB_ACCESS_TOKEN` / `WB_REFRESH_TOKEN`。
 
 ### 提醒：凭证临期时脚本的行为
 
-`Bearer` 凭证脚本能自己解析 JWT 的 exp，剩余不足 **21 天**会在日志里给出 WARN 并通过邮件提醒（若配置了邮件）。`Cookie` 凭证无法本地预判有效期，**只有服务端返回 401/403 时才会暴露** —— 所以用 Cookie 的话更要留意 Actions 的运行结果。
+`Bearer` 凭证脚本能自己解析 JWT 的 exp，剩余不足 **21 天**会在日志里给出 WARN（默认静默，不发邮件）。`Cookie` 凭证无法本地预判有效期，**只有服务端返回 401/403 时才会暴露** —— 所以用 Cookie 的话更要留意 Actions 的运行结果。
 
 > 可选增强：如果你本机装了 `gh` CLI，可以加一个 Windows 计划任务，在开机时自动执行
 > `gh secret set WB_ACCESS_TOKEN --repo <user>/wb-checkin --body-file <token文件>`
@@ -241,10 +247,10 @@ A：不是。说明今天已经领过了（手动领或脚本领都算），脚�
 A：域名错了。必须用 `www.workbuddy.cn`，网上有些文章写的 `copilot.tencent.com` 会 404。
 
 **Q：邮件怎么彻底关掉？**
-A：删掉 5 个 SMTP Secret 就行（Settings → Secrets）。代码不用改，也不用重新推送。此时工作流失败仍会让 GitHub 通知你的 GitHub 账号邮箱。
+A：默认就是关的，什么都不用做。若之前配过，删掉 `WB_ALERT_ENABLED` 或 5 个 SMTP Secret 即可。GitHub 自身的工作流失败通知不属于脚本，可在 GitHub 通知设置里关闭。
 
-**Q：邮件没收到？**
-A：四个邮件变量（`SMTP_HOST`/`SMTP_USER`/`SMTP_PASS`/`ALERT_TO`）必须全部存在才会发信；只在失败或有凭证告警时发。想测试通道可以用 `--notify-on-success` 强制每次都发。
+**Q：邮件没收到（确实想开启告警）？**
+A：需要同时满足：`WB_ALERT_ENABLED=1` + `SMTP_HOST`/`SMTP_USER`/`SMTP_PASS`/`ALERT_TO` 全部存在。只在失败或有凭证告警时发；想测试通道可以用 `--notify-on-success` 强制每次发送。
 
 **Q：鉴权失败（HTTP 401）？**
 A：凭证过期。重跑「第一步」用浏览器 F12 重新取一次，更新 `WB_ACCESS_TOKEN` 或 `WB_COOKIE`。
